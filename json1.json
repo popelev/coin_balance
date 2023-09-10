@@ -1,6 +1,4 @@
-import json
-
-str_json = """{
+{
   "last_scanned_block": 17987494,
   "blocks": {
     "17986230": {
@@ -36,26 +34,4 @@ str_json = """{
       }
     }
   }
-}"""
-
-data = json.loads(str_json)
-start_balance = 0
-
-json_file_after = { "events" : []}
-
-for block_number in data["blocks"]:
-        for tx_hash in data["blocks"][block_number]:
-                for event_number in data["blocks"][block_number][tx_hash]:
-                    addr_from = data["blocks"][block_number][tx_hash][event_number]["from"]
-                    addr_to = data["blocks"][block_number][tx_hash][event_number]["to"]
-                    value = data["blocks"][block_number][tx_hash][event_number]["value"]
-                    json_file_after["events"].append(
-                        {"block": block_number, 
-                            "tx_hash": tx_hash,
-                            "address_from": addr_from,
-                            "address_to": addr_to,
-                            "value": value
-                            })
-
-# print((json_file_after))
-print(json_file_after)
+}

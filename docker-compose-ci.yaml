@@ -1,11 +1,25 @@
 version: "3.7"
 services:
+  # nginx service
+  web:
+    container_name: "web"
+    image: nginx:alpine
+    depends_on:
+      - app
+    ports:
+      - "8082:80"
+    volumes:
+      - ./app/conf.d:/etc/nginx/conf.d
+    networks:
+      - custom
+
   # application service
   app:
     container_name: "app"
     image: app
     environment:
       - MONGODB_URL=mongodb://mongo_db/test_database
+      - RPC=https://mainnet.infura.io/v3/1df40ac1020e4a9083b81e1e7c6892be
     build:
       context: .
       dockerfile: Dockerfile
@@ -21,7 +35,7 @@ services:
     image: mongo
     container_name: "mongo_db"
     ports:
-      - "27017:27017"
+      - "27018:27017"
     networks:
       - custom
 networks:

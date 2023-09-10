@@ -5,8 +5,8 @@ from abc import ABC, abstractmethod
 from typing import Dict, Tuple, Optional, Callable, List, Iterable
 from requests import ReadTimeout
 
-from web3 import Web3
-from web3.contract import Contract
+from web3 import AsyncWeb3
+from web3.contract import AsyncContract
 from web3.datastructures import AttributeDict
 from web3.exceptions import BlockNotFound
 from eth_abi.codec import ABICodec
@@ -18,8 +18,8 @@ from web3._utils.events import get_event_data
 
 from hexbytes import HexBytes
 
-import os
-from dotenv import load_dotenv
+# import os
+# from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ class EventScanner:
     because it cannot correctly throttle and decrease the `eth_get_logs` block number range.
     """
 
-    def __init__(self, web3: Web3, contract: Contract, state: EventScannerState, events: List, filters: Dict,
+    def __init__(self, web3: AsyncWeb3, contract: AsyncContract, state: EventScannerState, events: List, filters: Dict,
                  max_chunk_scan_size: int = 10000, max_request_retries: int = 4, request_retry_seconds: float = 12.0):
         """
         :param contract: Contract
@@ -117,10 +117,10 @@ class EventScanner:
     def address(self):
         return self.token_address
 
-    def get_block_timestamp(self, block_num) -> datetime.datetime:
+    async def get_block_timestamp(self, block_num) -> datetime.datetime:
         """Get Ethereum block timestamp"""
         try:
-            block_info = self.web3.eth.get_block(block_num)
+            block_info = await self.web3.eth.get_block(block_num)
         except BlockNotFound:
             # Block was not mined yet,
             # minor chain reorganisation?
@@ -143,9 +143,9 @@ class EventScanner:
             return max(1, end_block - self.NUM_BLOCKS_RESCAN_FOR_FORKS)
         return 1
 
-    def get_suggested_scan_end_block(self):
+    async def get_suggested_scan_end_block(self):
         """Get the last mined block on Ethereum chain we are following."""
-        block = self.web3.eth.get_block('latest')
+        block = await self.web3.eth.get_block('latest')
         # Do not scan all the way to the final block, as this
         # block might not be mined yet
         return block.number - 1
@@ -158,7 +158,7 @@ class EventScanner:
         """Purge old data in the case of blockchain reorganisation."""
         self.state.delete_data(after_block)
 
-    def scan_chunk(self, start_block, end_block) -> Tuple[int, datetime.datetime, list]:
+    async def scan_chunk(self, start_block, end_block) -> Tuple[int, datetime.datetime, list]:
         """Read and process events between to block numbers.
 
         Dynamically decrease the size of the chunk if the case JSON-RPC server pukes out.
@@ -171,20 +171,20 @@ class EventScanner:
 
         # Cache block timestamps to reduce some RPC overhead
         # Real solution might include smarter models around block
-        def get_block_when(block_num):
+        async def get_block_when(block_num):
             if block_num not in block_timestamps:
-                block_timestamps[block_num] = get_block_timestamp(block_num)
+                block_timestamps[block_num] = await get_block_timestamp(block_num)
             return block_timestamps[block_num]
 
         all_processed = []
 
-        target_event_type = self.filters['event_type']
+        target_event_type = self.filters["event_type"]
         filtered_events = [event_type for event_type in self.events if event_type.event_name==target_event_type]
         for event_type in filtered_events:
 
             # Callable that takes care of the underlying web3 call
-            def _fetch_events(_start_block, _end_block):
-                return _fetch_events_for_all_contracts(self.web3,
+            async def _fetch_events(_start_block, _end_block):
+                return await _fetch_events_for_all_contracts(self.web3,
                                                        event_type,
                                                        self.filters,
                                                        from_block=_start_block,
@@ -192,7 +192,7 @@ class EventScanner:
 
             # Do `n` retries on `eth_get_logs`,
             # throttle down block range if needed
-            end_block, events = _retry_web3_call(
+            end_block, events = await _retry_web3_call(
                 _fetch_events,
                 start_block=start_block,
                 end_block=end_block,
@@ -211,14 +211,12 @@ class EventScanner:
 
                 # Get UTC time when this event happened (block mined timestamp)
                 # from our in-memory cache
-                block_when = get_block_when(block_number)
-
-                logger.debug("Processing event %s, block:%d count:%d",
-                             evt["event"], evt["blockNumber"])
+                block_when = await get_block_when(block_number)
+                logger.info(f"Processing event {evt['event']}, block:{evt['blockNumber']} count:%d")
                 processed = self.state.process_event(block_when, evt)
                 all_processed.append(processed)
 
-        end_block_timestamp = get_block_when(end_block)
+        end_block_timestamp = await get_block_when(end_block)
         return end_block, end_block_timestamp, all_processed
 
     def estimate_next_chunk_size(self, current_chuck_size: int, event_found_count: int):
@@ -250,7 +248,7 @@ class EventScanner:
         current_chuck_size = min(self.max_scan_chunk_size, current_chuck_size)
         return int(current_chuck_size)
 
-    def scan(self, start_block, end_block, start_chunk_size=20) -> Tuple[
+    async def scan(self, start_block, end_block, start_chunk_size=20) -> Tuple[
             list, int]:
         """Perform a token balances scan.
 
@@ -285,13 +283,10 @@ class EventScanner:
 
             # Print some diagnostics to logs to try to fiddle with real world JSON-RPC API performance
             estimated_end_block = current_block + chunk_size
-            # logger.debug(
-            print(
-                "Scanning token transfers for blocks: %d - %d, chunk size %d, last chunk scan took %f, last logs found %d" % (
-                current_block, estimated_end_block, chunk_size, last_scan_duration, last_logs_found))
+            logger.info(f"Scanning token transfers for blocks: {current_block} - {estimated_end_block}, chunk size {chunk_size}, last chunk scan took {last_scan_duration}, last logs found {last_logs_found}")
 
             start = time.time()
-            actual_end_block, end_block_timestamp, new_entries = self.scan_chunk(current_block, estimated_end_block)
+            actual_end_block, end_block_timestamp, new_entries = await self.scan_chunk(current_block, estimated_end_block)
             last_logs_found = len(new_entries)
             # Where does our current chunk scan ends - are we out of chain yet?
             current_end = actual_end_block
@@ -312,7 +307,7 @@ class EventScanner:
         return all_processed, total_chunks_scanned
 
 
-def _retry_web3_call(func, start_block, end_block, retries, delay) -> Tuple[int, list]:
+async def _retry_web3_call(func, start_block, end_block, retries, delay) -> Tuple[int, list]:
     """A custom retry loop to throttle down block range.
 
     If our JSON-RPC server cannot serve all incoming `eth_get_logs` in a single request,
@@ -329,20 +324,14 @@ def _retry_web3_call(func, start_block, end_block, retries, delay) -> Tuple[int,
     """
     for i in range(retries):
         try:
-            return end_block, func(start_block, end_block)
+            return end_block, await func(start_block, end_block)
         except Exception as e:
             # Assume this is HTTPConnectionPool(host='localhost', port=8545): Read timed out. (read timeout=10)
             # from Go Ethereum. This translates to the error "context was cancelled" on the server side:
             # https://github.com/ethereum/go-ethereum/issues/20426
             if i < retries - 1:
                 # Give some more verbose info than the default middleware
-                logger.warning(
-                    "Retrying events for block range %d - %d (%d) failed with %s, retrying in %s seconds",
-                    start_block,
-                    end_block,
-                    end_block-start_block,
-                    e,
-                    delay)
+                logger.warning(f"Retrying events for block range {start_block} - {end_block} ({end_block-start_block}) failed with {e}, retrying in {delay} seconds")
                 # Decrease the `eth_getBlocks` range
                 end_block = start_block + ((end_block - start_block) // 2)
                 # Let the JSON-RPC to recover e.g. from restart
@@ -353,7 +342,7 @@ def _retry_web3_call(func, start_block, end_block, retries, delay) -> Tuple[int,
                 raise
 
 
-def _fetch_events_for_all_contracts(
+async def _fetch_events_for_all_contracts(
         web3,
         event,
         argument_filters: dict,
@@ -397,12 +386,11 @@ def _fetch_events_for_all_contracts(
         toBlock=to_block
     )
 
-    logger.debug(
-        "Querying eth_get_logs with the following parameters: %s", event_filter_params)
+    logger.info(f"Querying eth_get_logs with the following parameters: {event_filter_params}")
 
     # Call JSON-RPC API on your Ethereum node.
     # get_logs() returns raw AttributedDict entries
-    logs = web3.eth.get_logs(event_filter_params)
+    logs = await web3.eth.get_logs(event_filter_params)
 
     # Convert raw binary data to Python proxy objects as described by ABI
     all_events = []
@@ -418,30 +406,25 @@ def _fetch_events_for_all_contracts(
 
 count_of_iteration = 0
 
-def get_contract_creation_block(web3, contract_address, blocknumber_from, blocknumber_to, count=0):
-        print(".")
+async def get_contract_creation_block(web3, contract_address, blocknumber_from, blocknumber_to, count=0):
+        logger.info("try to finde creation block ...")
         middle_block = (blocknumber_from + blocknumber_to) // 2
-        n_minus_one_is_contract = str(web3.eth.get_code(contract_address, middle_block-1).hex()) != str(HexBytes('0x').hex())
-        n_is_contract = str(web3.eth.get_code(contract_address, middle_block).hex()) != str(HexBytes('0x').hex())
+        n_minus_one_is_contract = str((await web3.eth.get_code(contract_address, middle_block-1)).hex()) != str(HexBytes('0x').hex())
+        n_is_contract = str((await web3.eth.get_code(contract_address, middle_block)).hex()) != str(HexBytes('0x').hex())
 
         if n_is_contract and not n_minus_one_is_contract:
-            print(count)
+            logger.info(count)
             return middle_block
         elif n_is_contract and n_minus_one_is_contract:       
-            return get_contract_creation_block(web3, contract_address, blocknumber_from, middle_block, count+1)
+            return await get_contract_creation_block(web3, contract_address, blocknumber_from, middle_block, count+1)
         else:
-            return get_contract_creation_block(web3, contract_address, middle_block, blocknumber_to, count+1)
+            return await get_contract_creation_block(web3, contract_address, middle_block, blocknumber_to, count+1)
 
-if __name__ == "__main__":
+async def filter(web3, contract_address):
     # import sys
     import json
-    from web3.providers.rpc import HTTPProvider
 
-    # We use tqdm library to render a nice progress bar in the console
-    # https://pypi.org/project/tqdm/
-    from tqdm import tqdm
-
-    TARGET_TOKEN_ADDRESS = "0xD533a949740bb3306d119CC777fa900bA034cd52"
+    TARGET_TOKEN_ADDRESS = contract_address
 
     # Reduced ERC-20 ABI, only Transfer event
     ABI = """[
@@ -494,10 +477,10 @@ if __name__ == "__main__":
             """Restore the last scan state from a file."""
             try:
                 self.state = json.load(open(self.fname, "rt"))
-                print(
+                logger.info(
                     f"Restored the state, previously {self.state['last_scanned_block']} blocks have been scanned")
             except (IOError, json.decoder.JSONDecodeError):
-                print("State starting from scratch")
+                logger.info("State starting from scratch")
                 self.reset()
 
         def save(self):
@@ -505,7 +488,6 @@ if __name__ == "__main__":
             with open(self.fname, "wt") as f:
                 json.dump(self.state, f)
             self.last_save = time.time()
-
         #
         # EventScannerState methods implemented below
         #
@@ -570,22 +552,11 @@ if __name__ == "__main__":
             # Return a pointer that allows us to look up this event later if needed
             return f"{block_number}-{txhash}-{log_index}"
 
-    def run():
-        load_dotenv()
-        RPC = os.getenv('RPC')        
+    async def run():
 
         # Enable logs to the stdout.
         # DEBUG is very verbose level
         logging.basicConfig(level=logging.INFO)
-
-        provider = HTTPProvider(RPC)
-
-        # Remove the default JSON-RPC retry middleware
-        # as it correctly cannot handle eth_get_logs block range
-        # throttle down.
-        provider.middlewares.clear()
-
-        web3 = Web3(provider)
 
         # Prepare stub ERC-20 contract object
         abi = json.loads(ABI)
@@ -621,22 +592,45 @@ if __name__ == "__main__":
 
         # Scan from [last block scanned] - [latest ethereum block]
         # Note that our chain reorg safety blocks cannot go negative
-        end_block = scanner.get_suggested_scan_end_block()
-        print("search the block of contract deploy")
-        cutoff_block = 10647806
-        # get_contract_creation_block(web3, TARGET_TOKEN_ADDRESS, 1, scanner.web3.eth.get_block('latest').number)
+        end_block = await scanner.get_suggested_scan_end_block()
+        logger.info("search the block of contract deploy")
+        latest_block_t = await scanner.web3.eth.get_block('latest')
+        latest_block = latest_block_t.number
+        cutoff_block = await get_contract_creation_block(web3, TARGET_TOKEN_ADDRESS, 1, latest_block)
         start = time.time()
         duration = time.time() - start
         blocks_to_scan = end_block - cutoff_block
-
-        logger.info(f"Scanning events from block {cutoff_block} ({datetime.datetime.fromtimestamp(scanner.web3.eth.get_block(cutoff_block).timestamp)}) - {end_block} ({datetime.datetime.fromtimestamp(scanner.web3.eth.get_block(end_block).timestamp)}), blocks_to_scan: {blocks_to_scan}. Scan envelop estimation took {duration} seconds")
+        ts_cb = await scanner.web3.eth.get_block(cutoff_block)
+        ts_eb = await scanner.web3.eth.get_block(end_block)
+        logger.info(f"Scanning events from block {cutoff_block} ({datetime.datetime.fromtimestamp(ts_cb.timestamp)}) - {end_block} ({datetime.datetime.fromtimestamp(ts_eb.timestamp)}), blocks_to_scan: {blocks_to_scan}. Scan envelop estimation took {duration} seconds")
 
         start = time.time()
-        result, total_chunks_scanned = scanner.scan(cutoff_block, end_block)
-        # result, total_chunks_scanned = scanner.scan(cutoff_block, (cutoff_block+1000))
+        result, total_chunks_scanned = await scanner.scan(cutoff_block, cutoff_block+100)
 
         state.save()
+        
         duration = time.time() - start
         logger.info(f"Scanned total {len(result)} Transfer events, in {duration} seconds, total {total_chunks_scanned} chunk scans performed")
 
-    run()
+        return state
+    
+    data_t = await run()
+    data = data_t.state
+    json_file_after = { "events" : []}
+
+    for block_number in data["blocks"]:
+            for tx_hash in data["blocks"][block_number]:
+                    for event_number in data["blocks"][block_number][tx_hash]:
+                        addr_from = data["blocks"][block_number][tx_hash][event_number]["from"]
+                        addr_to = data["blocks"][block_number][tx_hash][event_number]["to"]
+                        value = data["blocks"][block_number][tx_hash][event_number]["value"]
+                        json_file_after["events"].append(
+                            {'block': block_number, 
+                                'tx_hash': str(tx_hash),
+                                'address_from': str(addr_from),
+                                'address_to': str(addr_to),
+                                'value': str(value)
+                                })
+
+    # return json.dumps(json_file_after)
+    return json_file_after

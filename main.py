@@ -84,34 +84,13 @@ async def balance_of_token(request: Request, user_address: str, contract_address
 async def contract_token_events(request: Request, contract_address: str,):
     # logger.setLevel(logging.DEBUG)
     web3 = instanciate_w3(RPC)
-    json_data = await filter(web3, contract_address)
-    # json_data= {
-    #     "last_scanned_block": 17987494,
-    #     "events": [
-    #         {
-    #         "block": "17986230",
-    #         "tx_hash": "0xba963f6a4e9619fac1faf66009e3ad7b5d3237bfff7a8b82da2762a99a7bcc56",
-    #         "address_from": "0x7B95Ec873268a6BFC6427e7a28e396Db9D0ebc65",
-    #         "address_to": "0x94E61aeA6aD9F699c9C7572B1a2E62661FeD98B6",
-    #         "value": "27796315810770500972682"
-    #         },
-    #         {
-    #         "block": "17986256",
-    #         "tx_hash": "0x923459c08a274286c77402851ba4a332deaf913e503082d50d29d2a49b694117",
-    #         "address_from": "0x94E61aeA6aD9F699c9C7572B1a2E62661FeD98B6",
-    #         "address_to": "0x38F5E5b4DA37531a6e85161e337e0238bB27aa90",
-    #         "value": "42287324927037809009"
-    #         }
-    #     ]
-    #     }
+    client = motor.motor_asyncio.AsyncIOMotorClient(DEFAULT_MONGO, serverSelectionTimeoutMS=5000)
     
-    client = motor.motor_asyncio.AsyncIOMotorClient(DEFAULT_MONGO)
-    db = client.local
-    collection = db.transferEvents
-    for event in json_data['events']:
-        await collection.insert_one(event)
+    database = client.testdb
     
-    return {"Success": True,
+    filter_success = await filter(database, web3, contract_address)    
+    
+    return {"Success": filter_success,
             "Contract": str(contract_address)}
 
 # @app.get("/address")

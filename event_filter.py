@@ -16,14 +16,16 @@ from eth_abi.codec import ABICodec
 from web3._utils.filters import construct_event_filter_params
 from web3._utils.events import get_event_data
 
-from hexbytes import HexBytes
+import asyncio
 
-# import os
-# from dotenv import load_dotenv
+import numpy as n
+
+from hexbytes import HexBytes
 
 logger = logging.getLogger(__name__)
 
-    
+MAX_CHUNK_SIZE = 1000
+
 class EventScannerState(ABC):
     """Application state that remembers what blocks we have scanned in the case of crash.
     """
@@ -33,13 +35,6 @@ class EventScannerState(ABC):
         """Number of the last block we have scanned on the previous cycle.
 
         :return: 0 if no blocks scanned yet
-        """
-
-    @abstractmethod
-    def start_chunk(self, block_number: int):
-        """Scanner is about to ask data of multiple blocks over JSON-RPC.
-
-        Start a database session if needed.
         """
 
     @abstractmethod
@@ -63,13 +58,6 @@ class EventScannerState(ABC):
         :return: Internal state structure that is the result of event tranformation.
         """
 
-    @abstractmethod
-    def delete_data(self, since_block: int) -> int:
-        """Delete any data since this block was scanned.
-
-        Purges any potential minor reorg data.
-        """
-
 
 class EventScanner:
     """Scan blockchain for events and try not to abuse JSON-RPC API too much.
@@ -82,7 +70,7 @@ class EventScanner:
     because it cannot correctly throttle and decrease the `eth_get_logs` block number range.
     """
 
-    def __init__(self, web3: AsyncWeb3, contract: AsyncContract, state: EventScannerState, events: List, filters: Dict,
+    def __init__(self, mongo, web3: AsyncWeb3, contract: AsyncContract, state: EventScannerState, events: List, filters: Dict,
                  max_chunk_scan_size: int = 10000, max_request_retries: int = 4, request_retry_seconds: float = 12.0):
         """
         :param contract: Contract
@@ -96,6 +84,8 @@ class EventScanner:
         self.logger = logger
         self.contract = contract
         self.web3 = web3
+        self.mongo = mongo
+
         self.state = state
         self.events = events
         self.filters = filters
@@ -154,10 +144,6 @@ class EventScanner:
     def get_last_scanned_block(self) -> int:
         return self.state.get_last_scanned_block()
 
-    def delete_potentially_forked_block_data(self, after_block: int):
-        """Purge old data in the case of blockchain reorganisation."""
-        self.state.delete_data(after_block)
-
     async def scan_chunk(self, start_block, end_block) -> Tuple[int, datetime.datetime, list]:
         """Read and process events between to block numbers.
 
@@ -212,7 +198,7 @@ class EventScanner:
                 # Get UTC time when this event happened (block mined timestamp)
                 # from our in-memory cache
                 block_when = await get_block_when(block_number)
-                logger.info(f"Processing event {evt['event']}, block:{evt['blockNumber']} count:%d")
+                logger.info(f"Processing event {evt['event']}, block:{evt['blockNumber']} TX-index :{evt['transactionIndex']} Log-index :{evt['logIndex']}")
                 processed = self.state.process_event(block_when, evt)
                 all_processed.append(processed)
 
@@ -250,61 +236,58 @@ class EventScanner:
 
     async def scan(self, start_block, end_block, start_chunk_size=20) -> Tuple[
             list, int]:
-        """Perform a token balances scan.
-
-        Assumes all balances in the database are valid before start_block (no forks sneaked in).
-
-        :param start_block: The first block included in the scan
-
-        :param end_block: The last block included in the scan
-
-        :param start_chunk_size: How many blocks we try to fetch over JSON-RPC on the first attempt
-
-        :param progress_callback: If this is an UI application, update the progress of the scan
-
-        :return: [All processed events, number of chunks used]
-        """
 
         assert start_block <= end_block
 
-        current_block = start_block
-
-        # Scan in chunks, commit between
-        chunk_size = start_chunk_size
-        last_scan_duration = last_logs_found = 0
-        total_chunks_scanned = 0
-
         # All processed entries we got on this scan cycle
-        all_processed = []
+        self.all_processed = []
 
-        while current_block <= end_block:
 
-            self.state.start_chunk(current_block, chunk_size)
+        async def taskCreator(self, start_b, end_b, start_chunk):
+            async def asincScan(start_b, end_b, chunk_size):
+                # pass
+                current_block = start_b
+                last_scan_duration = last_logs_found = 0
+                while current_block <= end_b:
+                    # Print some diagnostics to logs to try to fiddle with real world JSON-RPC API performance
+                    estimated_end_block = current_block + chunk_size
+                    logger.info(f"Scanning token transfers for blocks: {current_block} - {estimated_end_block}, chunk size {chunk_size}, last chunk scan took {last_scan_duration}, last logs found {last_logs_found}")
 
-            # Print some diagnostics to logs to try to fiddle with real world JSON-RPC API performance
-            estimated_end_block = current_block + chunk_size
-            logger.info(f"Scanning token transfers for blocks: {current_block} - {estimated_end_block}, chunk size {chunk_size}, last chunk scan took {last_scan_duration}, last logs found {last_logs_found}")
+                    start = time.time()
+                    actual_end_block, end_block_timestamp, new_entries = await self.scan_chunk(current_block, estimated_end_block)
+                    last_logs_found = len(new_entries)
+                    # Where does our current chunk scan ends - are we out of chain yet?
+                    current_end = actual_end_block
 
-            start = time.time()
-            actual_end_block, end_block_timestamp, new_entries = await self.scan_chunk(current_block, estimated_end_block)
-            last_logs_found = len(new_entries)
-            # Where does our current chunk scan ends - are we out of chain yet?
-            current_end = actual_end_block
+                    last_scan_duration = time.time() - start
 
-            last_scan_duration = time.time() - start
-            all_processed += new_entries
+                    self.all_processed += new_entries
 
-            # Try to guess how many blocks to fetch over `eth_get_logs` API next time
-            chunk_size = self.estimate_next_chunk_size(
-                chunk_size, len(new_entries))
-            chunk_size = chunk_size if chunk_size<=2000 else 2000
+                    # Try to guess how many blocks to fetch over `eth_get_logs` API next time
+                    chunk_size = self.estimate_next_chunk_size(
+                        chunk_size, len(new_entries))
+                    chunk_size = chunk_size if chunk_size<=MAX_CHUNK_SIZE else MAX_CHUNK_SIZE
 
-            # Set where the next chunk starts
-            current_block = current_end + 1
-            total_chunks_scanned += 1
-            self.state.end_chunk(current_end)
+                    # Set where the next chunk starts
+                    current_block = current_end + 1
+                    # total_chunks_scanned += 1
+                    self.state.end_chunk(current_end)
+                
+            tasks = []
+            cursor_b = start_b
+            while cursor_b + MAX_CHUNK_SIZE < end_b:
+                    start = cursor_b
+                    stop =  cursor_b + MAX_CHUNK_SIZE - 1
+                    cursor_b = cursor_b + MAX_CHUNK_SIZE
+                    tasks.append(asyncio.create_task(asincScan(start, stop, start_chunk)))
+            tasks.append(asyncio.create_task(asincScan(cursor_b, end_block, start_chunk)))
 
-        return all_processed, total_chunks_scanned
+            await asyncio.gather(*tasks)
+            print("all tasks done")
+            
+         
+        zzz = await taskCreator(self, start_block, end_block, start_chunk_size)
+        return self.all_processed
 
 
 async def _retry_web3_call(func, start_block, end_block, retries, delay) -> Tuple[int, list]:
@@ -340,7 +323,6 @@ async def _retry_web3_call(func, start_block, end_block, retries, delay) -> Tupl
             else:
                 logger.warning("Out of retries")
                 raise
-
 
 async def _fetch_events_for_all_contracts(
         web3,
@@ -420,7 +402,7 @@ async def get_contract_creation_block(web3, contract_address, blocknumber_from, 
         else:
             return await get_contract_creation_block(web3, contract_address, middle_block, blocknumber_to, count+1)
 
-async def filter(web3, contract_address):
+async def filter(mongo, web3, contract_address):
     # import sys
     import json
 
@@ -473,46 +455,32 @@ async def filter(web3, contract_address):
                 "blocks": {},
             }
 
-        def restore(self):
+        async def restore(self, contract_address):
             """Restore the last scan state from a file."""
             try:
-                self.state = json.load(open(self.fname, "rt"))
+                logger.info("search the block of contract deploy")
+                last_scanned_block = await mongo.lastScannedBlock.find_one({"contract_address": contract_address})
+                self.state = {
+                "last_scanned_block": last_scanned_block['block_number'],
+                "blocks": {},
+            }
                 logger.info(
                     f"Restored the state, previously {self.state['last_scanned_block']} blocks have been scanned")
-            except (IOError, json.decoder.JSONDecodeError):
+            except:
                 logger.info("State starting from scratch")
                 self.reset()
 
         def save(self):
-            """Save everything we have scanned so far in a file."""
-            with open(self.fname, "wt") as f:
-                json.dump(self.state, f)
-            self.last_save = time.time()
-        #
-        # EventScannerState methods implemented below
-        #
-
+            print("TODO_save()")
+            
         def get_last_scanned_block(self):
             """The number of the last block we have stored."""
             return self.state["last_scanned_block"]
 
-        def delete_data(self, since_block):
-            """Remove potentially reorganised blocks from the scan data."""
-            for block_num in range(since_block, self.get_last_scanned_block()):
-                if block_num in self.state["blocks"]:
-                    del self.state["blocks"][block_num]
-
-        def start_chunk(self, block_number, chunk_size):
-            pass
-
-        def end_chunk(self, block_number):
+        async def end_chunk(self, block_number):
             """Save at the end of each block, so we can resume in the case of a crash or CTRL+C"""
-            # Next time the scanner is started we will resume from this block
-            self.state["last_scanned_block"] = block_number
 
-            # Save the database file for every minute
-            if time.time() - self.last_save > 60:
-                self.save()
+            await mongo.lastScannedBlock.find_one_and_update({"contract_address": self.filters["address"]}, {"block_number": block_number })
 
         def process_event(self, block_when: datetime.datetime, event: AttributeDict) -> str:
             """Record a ERC-20 transfer in our database."""
@@ -564,10 +532,11 @@ async def filter(web3, contract_address):
 
         # Restore/create our persistent state
         state = JSONifiedState()
-        state.restore()
+        await state.restore(TARGET_TOKEN_ADDRESS)
 
         # chain_id: int, web3: Web3, abi: dict, state: EventScannerState, events: List, filters: {}, max_chunk_scan_size: int=10000
         scanner = EventScanner(
+            mongo=mongo,
             web3=web3,
             contract=ERC20,
             state=state,
@@ -577,7 +546,7 @@ async def filter(web3, contract_address):
                 "event_type" : "Transfer"
             },
             # How many maximum blocks at the time we request from JSON-RPC and we are unlikely to exceed the response size limit of the JSON-RPC server
-            max_chunk_scan_size=2000
+            max_chunk_scan_size=MAX_CHUNK_SIZE
         )
 
         # Assume we might have scanned the blocks all the way to the last Ethereum block
@@ -592,33 +561,38 @@ async def filter(web3, contract_address):
 
         # Scan from [last block scanned] - [latest ethereum block]
         # Note that our chain reorg safety blocks cannot go negative
-        end_block = await scanner.get_suggested_scan_end_block()
-        logger.info("search the block of contract deploy")
         latest_block_t = await scanner.web3.eth.get_block('latest')
         latest_block = latest_block_t.number
-        cutoff_block = await get_contract_creation_block(web3, TARGET_TOKEN_ADDRESS, 1, latest_block)
+        cutoff_block = state.state['last_scanned_block']
+        if(cutoff_block == 0):
+            cutoff_block = await get_contract_creation_block(web3, TARGET_TOKEN_ADDRESS, 1, latest_block)
+            await mongo.lastScannedBlock.insert_one({"contract_address": contract_address, "block_number": cutoff_block})
+        
         start = time.time()
         duration = time.time() - start
+
+        end_block = await scanner.get_suggested_scan_end_block()
         blocks_to_scan = end_block - cutoff_block
+
         ts_cb = await scanner.web3.eth.get_block(cutoff_block)
         ts_eb = await scanner.web3.eth.get_block(end_block)
         logger.info(f"Scanning events from block {cutoff_block} ({datetime.datetime.fromtimestamp(ts_cb.timestamp)}) - {end_block} ({datetime.datetime.fromtimestamp(ts_eb.timestamp)}), blocks_to_scan: {blocks_to_scan}. Scan envelop estimation took {duration} seconds")
 
         start = time.time()
-        result, total_chunks_scanned = await scanner.scan(cutoff_block, cutoff_block+100)
+
+        await scanner.scan(cutoff_block, cutoff_block + MAX_CHUNK_SIZE*5+1)
+
+        result = scanner.all_processed
 
         state.save()
         
         duration = time.time() - start
-        logger.info(f"Scanned total {len(result)} Transfer events, in {duration} seconds, total {total_chunks_scanned} chunk scans performed")
+        logger.info(f"Scanned total {len(result)} Transfer events, in {duration} seconds")
+        
+        json_file_after = { "events" : []}
+        data = state.state
 
-        return state
-    
-    data_t = await run()
-    data = data_t.state
-    json_file_after = { "events" : []}
-
-    for block_number in data["blocks"]:
+        for block_number in data["blocks"]:
             for tx_hash in data["blocks"][block_number]:
                     for event_number in data["blocks"][block_number][tx_hash]:
                         addr_from = data["blocks"][block_number][tx_hash][event_number]["from"]
@@ -631,6 +605,11 @@ async def filter(web3, contract_address):
                                 'address_to': str(addr_to),
                                 'value': str(value)
                                 })
+                        
+        if json_file_after['events'] != []:
+            await mongo.transferEvents.insert_many(json_file_after['events'])
 
-    # return json.dumps(json_file_after)
-    return json_file_after
+        return True
+    
+    success = await run()
+    return success
